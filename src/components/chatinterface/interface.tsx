@@ -1,0 +1,455 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { motion } from 'framer-motion';
+import { Send, Bot, User, Maximize, Minimize, Loader2, Square, ChevronDown } from 'lucide-react';
+import io from 'socket.io-client';
+import { format } from 'date-fns';
+import Image from 'next/image';
+
+// Initialize socket connection
+const socket = io('https://zt7rwk6f-5000.inc1.devtunnels.ms', {
+  transports: ['websocket'],
+  withCredentials: true
+});
+
+interface Message {
+  _id: string;
+  userId: string;
+  sessionId: string;
+  text: string;
+  isUser: boolean;
+  timestamp: Date;
+  book?: string;
+  images?: Array<{ path: string; page: number }>;
+  metadata?: {
+    pages?: number[];
+    citations?: string[];
+  };
+}
+
+interface ChatAppProps {
+  sessionId: string;
+  onUpdateSession: (title: string, lastMessage: string) => void;
+}
+
+const ChatApp: React.FC<ChatAppProps> = ({ sessionId, onUpdateSession }) => {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [question, setQuestion] = useState('');
+  const [isTyping, setIsTyping] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const [currentResponse, setCurrentResponse] = useState('');
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [books, setBooks] = useState<string[]>([]);
+  const [selectedBook, setSelectedBook] = useState<string>('');
+  const [isDropdownOpen, setIsDropdownOpen] = useState(false);
+  const [imageCache, setImageCache] = useState<Record<string, string>>({});
+  
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messageBuffer = useRef<string>('');
+
+  // Handle image loading state
+  const [imageLoadErrors, setImageLoadErrors] = useState<Record<string, boolean>>({});
+  
+  useEffect(() => {
+    const fetchSessionData = async () => {
+      if (!sessionId) return;
+      
+      try {
+        const sessionResponse = await fetch(`/api/chat-sessions/${sessionId}`);
+        if (sessionResponse.ok) {
+          const { session } = await sessionResponse.json();
+          if (session.selectedBook) {
+            setSelectedBook(session.selectedBook);
+          }
+        }
+
+        const messagesResponse = await fetch(`/api/chat-sessions/${sessionId}/messages`);
+        if (messagesResponse.ok) {
+          const data = await messagesResponse.json();
+          setMessages(data.messages.map((msg: Message) => ({
+            ...msg,
+            timestamp: new Date(msg.timestamp)
+          })));
+        }
+      } catch (error) {
+        console.error('Failed to fetch session data:', error);
+      }
+    };
+
+    socket.emit('get_books');
+    
+    socket.on('books_list', (data: { books: string[] }) => {
+      setBooks(data.books);
+      if (data.books.length > 0 && !selectedBook) {
+        setSelectedBook(data.books[0]);
+      }
+    });
+
+    socket.on('image_data', (data: { url: string, data: string }) => {
+      setImageCache(prev => ({
+        ...prev,
+        [data.url]: data.data
+      }));
+    });
+
+    fetchSessionData();
+
+    return () => {
+      socket.off('books_list');
+      socket.off('image_data');
+    };
+  }, [sessionId, selectedBook]);
+
+  const saveMessage = useCallback(async (text: string, isUser: boolean) => {
+    if (!sessionId) return null;
+  
+    try {
+      const response = await fetch(`/api/chat-sessions/${sessionId}/messages`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          text,
+          isUser,
+          book: selectedBook
+        }),
+      });
+  
+      if (response.ok) {
+        const { message } = await response.json();
+        if (isUser) {
+          onUpdateSession(text.substring(0, 50), text);
+        }
+        return message;
+      }
+    } catch (error) {
+      console.error('Failed to save message:', error);
+    }
+    return null;
+  }, [sessionId, selectedBook, onUpdateSession]);
+
+  useEffect(() => {
+    let currentMessageBuffer = '';
+
+    const handleStreamResponse = (data: { word: string }) => {
+      setIsTyping(true);
+      currentMessageBuffer += data.word;
+      setCurrentResponse(currentMessageBuffer);
+      messageBuffer.current = currentMessageBuffer;
+    };
+
+    const handleImageReferences = (data: { images: Array<{ path: string; page: number }> }) => {
+      const imageMarkdown = data.images
+        .map(img => `\n![Image from page ${img.page}](${img.path})`)
+        .join('\n');
+      currentMessageBuffer += '\n\n🖼️ Related Images:' + imageMarkdown;
+      setCurrentResponse(currentMessageBuffer);
+      messageBuffer.current = currentMessageBuffer;
+    };
+
+    const handleResponseComplete = async () => {
+      try {
+        if (messageBuffer.current.trim()) {
+          const botMessage = await saveMessage(messageBuffer.current.trim(), false);
+          if (botMessage) {
+            setMessages(prev => [...prev, botMessage]);
+          }
+        }
+        setIsTyping(false);
+        setIsGenerating(false);
+        currentMessageBuffer = '';
+        messageBuffer.current = '';
+        setCurrentResponse('');
+      } catch (error) {
+        console.error('Error handling response:', error);
+      }
+    };
+
+    socket.on('stream_response', handleStreamResponse);
+    socket.on('response_complete', handleResponseComplete);
+    socket.on('image_references', handleImageReferences);
+
+    return () => {
+      socket.off('stream_response', handleStreamResponse);
+      socket.off('response_complete', handleResponseComplete);
+      socket.off('image_references', handleImageReferences);
+    };
+  }, [sessionId, selectedBook, onUpdateSession, saveMessage]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, currentResponse]);
+
+  const handleBookSelection = async (book: string) => {
+    setSelectedBook(book);
+    setIsDropdownOpen(false);
+
+    try {
+      await fetch(`/api/chat-sessions/${sessionId}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          selectedBook: book
+        }),
+      });
+    } catch (error) {
+      console.error('Failed to update session book:', error);
+    }
+  };
+
+  const handleQuestionSubmit = async () => {
+    if (!question.trim() || isGenerating || !selectedBook) return;
+
+    try {
+      const currentQuestionText = question.trim();
+      const userMessage = await saveMessage(currentQuestionText, true);
+      if (userMessage) {
+        setMessages(prevMessages => [...prevMessages, userMessage]);
+      }
+      
+      setQuestion('');
+      setIsTyping(true);
+      setIsGenerating(true);
+      messageBuffer.current = '';
+      setCurrentResponse('');
+
+      socket.emit('ask_question', {
+        question: currentQuestionText,
+        sessionId,
+        book: selectedBook
+      });
+    } catch (error) {
+      console.error('Error submitting question:', error);
+      setIsTyping(false);
+      setIsGenerating(false);
+    }
+  };
+
+  const handleStopGeneration = () => {
+    setIsGenerating(false);
+    setIsTyping(false);
+    socket.emit('stop_generation');
+    
+    if (messageBuffer.current.trim()) {
+      saveMessage(messageBuffer.current.trim(), false).then(botMessage => {
+        if (botMessage) {
+          setMessages(prev => [...prev, botMessage]);
+        }
+        messageBuffer.current = '';
+        setCurrentResponse('');
+      });
+    }
+  };
+
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleQuestionSubmit();
+    }
+  };
+
+  const formatMessageTime = (timestamp: Date) => {
+    return format(new Date(timestamp), 'h:mm a');
+  };
+
+  const parseContent = (text: string) => {
+    const parts: Array<{ type: 'text' | 'image'; content: string; alt?: string; }> = [];
+    const lines = text.split('\n');
+    let currentText = '';
+
+    lines.forEach(line => {
+      const imageMatch = line.match(/!\[(.*?)\]\((.*?)\)/) || line.match(/Image from page (\d+)\s*(.*)/);
+      if (imageMatch) {
+        if (currentText) {
+          parts.push({ type: 'text', content: currentText.trim() });
+          currentText = '';
+        }
+        const alt = imageMatch[1] || `Image from page ${imageMatch[1]}`;
+        const imagePath = imageMatch[2] || imageMatch[2];
+        parts.push({
+          type: 'image',
+          content: imagePath,
+          alt: alt
+        });
+      } else {
+        currentText += line + '\n';
+      }
+    });
+
+    if (currentText) {
+      parts.push({ type: 'text', content: currentText.trim() });
+    }
+
+    return parts;
+  };
+
+  const renderMessage = (message: Message | { text: string; isUser: boolean; timestamp?: Date }, isCurrent = false) => {
+    const messageParts = parseContent(message.text);
+
+    return (
+      <motion.div
+        key={isCurrent ? 'current' : (message as Message)._id}
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.3 }}
+        className={`flex items-start space-x-2 ${message.isUser ? 'flex-row-reverse space-x-reverse' : ''}`}
+      >
+        <div className={`w-8 h-8 rounded-full flex items-center justify-center ${
+          message.isUser ? 'bg-purple-500/20' : 'bg-blue-500/20'
+        }`}>
+          {message.isUser ? (
+            <User className="w-5 h-5 text-purple-400" />
+          ) : (
+            <Bot className="w-5 h-5 text-blue-400" />
+          )}
+        </div>
+
+        <div className="max-w-[80%]">
+          <div className={`rounded-lg px-4 py-2 ${
+            message.isUser ? 'bg-purple-500/10 text-gray-200' : 'bg-blue-500/10 text-gray-200'
+          }`}>
+            {messageParts.map((part, index) => (
+              <div key={index} className={part.type === 'image' ? 'my-2' : ''}>
+                {part.type === 'text' ? (
+                  <p className="text-sm whitespace-pre-wrap">{part.content}</p>
+                ) : (
+                  <div className="rounded-lg overflow-hidden bg-gray-800/50 my-2">
+                    {!imageLoadErrors[part.content] && (
+                      <Image
+                        src={imageCache[part.content] || `https://zt7rwk6f-5000.inc1.devtunnels.ms/${part.content}`}
+                        alt={part.alt || 'Message image'}
+                        width={600}
+                        height={400}
+                        className="max-w-full h-auto rounded-lg"
+                        style={{ maxHeight: '300px', objectFit: 'contain' }}
+                        onError={() => {
+                          console.error('Image failed to load:', part.content);
+                          setImageLoadErrors(prev => ({ ...prev, [part.content]: true }));
+                        }}
+                        onLoad={() => console.log('Image loaded successfully:', part.content)}
+                      />
+                    )}
+                    <p className="text-xs text-gray-400 mt-1 px-2 pb-2">{part.alt}</p>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+          {message.timestamp && (
+            <span className="text-xs text-gray-500 mt-1 block">
+              {formatMessageTime(message.timestamp)}
+            </span>
+          )}
+        </div>
+      </motion.div>
+    );
+  };
+
+  useEffect(() => {
+    const loadMessages = async () => {
+      if (sessionId) {
+        try {
+          const response = await fetch(`/api/chat-sessions/${sessionId}/messages`);
+          if (response.ok) {
+            const data = await response.json();
+            setMessages(data.messages);
+          }
+        } catch (error) {
+          console.error('Failed to load messages:', error);
+        }
+      }
+    };
+
+    loadMessages();
+  }, [sessionId]);
+
+  return (
+    <div className="h-full flex flex-col relative">
+      <div className="absolute top-4 right-4 z-50 book-dropdown">
+        <div className="relative">
+          <button
+            onClick={() => setIsDropdownOpen(!isDropdownOpen)}
+            className="flex items-center space-x-2 bg-gray-700/30 text-gray-200 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            <span>{selectedBook || 'Select a book'}</span>
+            <ChevronDown className={`w-4 h-4 transition-transform ${isDropdownOpen ? 'transform rotate-180' : ''}`} />
+          </button>
+          
+          {isDropdownOpen && (
+            <div className="absolute right-0 mt-2 w-48 bg-gray-800 border border-gray-700 rounded-lg shadow-lg overflow-hidden">
+              {books.map((book) => (
+                <button
+                  key={book}
+                  onClick={() => handleBookSelection(book)}
+                  className={`w-full text-left px-4 py-2 text-sm
+                    ${book === selectedBook ? 'bg-purple-500/20' : 'hover:bg-gray-700/50'}
+                    text-gray-200 focus:outline-none`}
+                >
+                  {book}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto px-4 pt-16 pb-4 space-y-4" style={{ maxHeight: '80vh' }}>
+        {messages.map((msg) => renderMessage(msg))}
+        {currentResponse && renderMessage({
+          text: currentResponse,
+          isUser: false,
+          timestamp: new Date()
+        }, true)}
+        {isTyping && !currentResponse && (
+          <div className="flex items-center space-x-2 text-gray-400">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            <span>Professor AI is thinking about {selectedBook}...</span>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      <div className="border-t border-gray-700/50 p-4 bg-[#0F0627]/40">
+        <div className="relative flex items-center">
+          <textarea
+            value={question}
+            onChange={(e) => setQuestion(e.target.value)}
+            onKeyDown={handleKeyPress}
+            placeholder={selectedBook ? `Ask about ${selectedBook}...` : 'Select a book first...'}
+            disabled={isGenerating || !selectedBook}
+            className="flex-1 bg-gray-700/30 text-gray-200 rounded-lg pl-4 pr-12 py-3 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+            rows={1}
+          />
+          {isGenerating ? (
+            <button
+              onClick={handleStopGeneration}
+              className="absolute right-2 p-2 text-red-400 hover:text-red-300"
+            >
+              <Square className="w-5 h-5" />
+            </button>
+          ) : (
+            <button
+              onClick={handleQuestionSubmit}
+              disabled={!question.trim() || !selectedBook}
+              className="absolute right-2 p-2 text-blue-400 hover:text-blue-300 disabled:text-gray-500"
+            >
+              <Send className="w-5 h-5" />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Expand/Collapse Button */}
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="absolute bottom-20 right-4 p-2 rounded-full bg-gray-700/50 text-gray-400 hover:text-gray-300"
+      >
+        {expanded ? <Minimize className="w-4 h-4" /> : <Maximize className="w-4 h-4" />}
+      </button>
+    </div>
+  );
+};
+
+export default ChatApp;
